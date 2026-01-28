@@ -606,23 +606,18 @@ def schedule_jobs(application: Application) -> None:
 
 
 # ========= MAIN =========
-async def main() -> None:
+def main() -> None:
     application = Application.builder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("get_timetable", cmd_get_timetable))
     application.add_handler(CommandHandler("set_reminder", cmd_set_reminder))
-
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     schedule_jobs(application)
 
-    print("🤖 Bot started")
-    print(f"⏰ TIMEZONE: {TIMEZONE}")
-
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
