@@ -1,17 +1,35 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-Telegram бот для напоминаний о учебных занятиях
+Telegram-бот для напоминаний о занятиях из CSV.
+
+Требования:
+- python-telegram-bot >= 20
+- Установить JobQueue: pip install "python-telegram-bot[job-queue]"
+- pytz
+
+Настройки вынесены в config.py (не коммитить), пример: config.example.py
 """
 
-import os
+from __future__ import annotations
+
+import asyncio
 import csv
 import json
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
-import asyncio
-import pytz
+import os
+import re
+from dataclasses import dataclass
+from datetime import datetime, timedelta, time as dtime
+from typing import Dict, List, Optional, Any
 
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+import pytz
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -21,599 +39,590 @@ from telegram.ext import (
     filters,
 )
 
-# ================= КОНФИГУРАЦИЯ =================
-CHAT_ID = -1001234567890  # Замени на ID чата: скопируй целое число, которое выведет бот при первом запуске
-TOKEN = "YOUR_BOT_TOKEN"  # Замени на токен от @BotFather
-CSV_FILE = "timetable.csv"  # Путь к CSV файлу с расписанием
+import config  # noqa: F401
 
-# ЧАСОВОЙ ПОЯС - ОЧЕНЬ ВАЖНО!
-# Установи свой часовой пояс (примеры: 'Europe/Moscow', 'UTC', 'Europe/London', 'America/New_York')
-TIMEZONE = pytz.timezone('Europe/Moscow')  # МСК
 
-# Часовые пояса (в формате часов:минут)
-REMINDER_MORNING_TIME = (7, 30)    # 7:30 - напоминание про сегодня
-REMINDER_EVENING_TIME = (19, 30)   # 19:30 - напоминание про завтра
+# ========= НАСТРОЙКИ (из config.py) =========
+TOKEN: str = config.TOKEN
+CHAT_ID: int = config.CHAT_ID
+CSV_FILE: str = config.CSV_FILE
 
-# ================= КЛАССЫ И ФУНКЦИИ =================
+TIMEZONE = config.TIMEZONE  # pytz timezone object
+REMINDER_MORNING_TIME = config.REMINDER_MORNING_TIME  # (7, 30)
+REMINDER_EVENING_TIME = config.REMINDER_EVENING_TIME  # (19, 30)
+
+REMINDERS_FILE = getattr(config, "REMINDERS_FILE", "reminders.json")
+MAX_REMINDERS_PER_USER = getattr(config, "MAX_REMINDERS_PER_USER", 20)
+
+# Если True: /get_timetable БЕЗ даты показывает расписание на следующий учебный день (по CSV),
+# а не просто на следующий будний день.
+NEXT_DAY_MODE_USE_CSV = getattr(config, "NEXT_DAY_MODE_USE_CSV", True)
+
+# Ограничение поиска "следующего учебного дня" вперед
+MAX_LOOKAHEAD_DAYS = getattr(config, "MAX_LOOKAHEAD_DAYS", 365)
+
+
+# ========= УТИЛИТЫ =========
+DATE_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
+
+
+def now_tz() -> datetime:
+    return datetime.now(TIMEZONE)
+
+
+def normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip())
+
+
+def parse_date_ddmmyyyy(s: str) -> datetime:
+    return datetime.strptime(s, "%d.%m.%Y")
+
+
+def format_date_ddmmyyyy(dt: datetime) -> str:
+    return dt.strftime("%d.%m.%Y")
+
+
+def is_working_day(dt: datetime) -> bool:
+    # 0..4 = Mon..Fri
+    return dt.weekday() < 5
+
+
+# ========= РАСПИСАНИЕ =========
+@dataclass(frozen=True)
+class LessonRow:
+    date_str: str
+    pair: int
+    discipline: str
+    theme: str
+    kind: str
+    teachers: str
+    room: str
+
+    @staticmethod
+    def from_csv_row(row: Dict[str, str]) -> "LessonRow":
+        def g(key: str) -> str:
+            return (row.get(key) or "").strip()
+
+        pair_s = g("Пара")
+        try:
+            pair_i = int(pair_s)
+        except Exception:
+            pair_i = 0
+
+        return LessonRow(
+            date_str=g("Дата"),
+            pair=pair_i,
+            discipline=g("Дисциплина"),
+            theme=g("Номер темы"),
+            kind=g("Вид занятия"),
+            teachers=g("Преподаватели"),
+            room=g("Ауд."),
+        )
+
 
 class Timetable:
-    """Класс для работы с расписанием"""
-    
     def __init__(self, csv_file: str):
-        self.data = []
-        self.load_csv(csv_file)
-    
-    def load_csv(self, csv_file: str):
-        """Загружает расписание из CSV файла"""
-        if not os.path.exists(csv_file):
-            print(f"Ошибка: файл {csv_file} не найден!")
-            return
-        
-        try:
-            with open(csv_file, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f, delimiter=';')
-                self.data = list(reader)
-        except Exception as e:
-            print(f"Ошибка при загрузке CSV: {e}")
-    
-    def parse_date(self, date_str: str) -> datetime:
-        """Парсит дату в формате ДД.МММ.ГГГГ"""
-        return datetime.strptime(date_str, "%d.%m.%Y")
-    
-    def date_to_str(self, date: datetime) -> str:
-        """Преобразует дату в строку ДД.МММ.ГГГГ"""
-        return date.strftime("%d.%m.%Y")
-    
-    def is_working_day(self, date: datetime) -> bool:
-        """Проверяет, является ли день рабочим (не выходной)"""
-        # 5 = суббота, 6 = воскресенье
-        return date.weekday() < 5
-    
-    def get_next_working_day(self, from_date: Optional[datetime] = None) -> datetime:
-        """Возвращает следующий рабочий день"""
-        if from_date is None:
-            from_date = datetime.now(TIMEZONE)
-        
-        current = from_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        if current == from_date.replace(hour=0, minute=0, second=0, microsecond=0):
-            current += timedelta(days=1)
-        else:
-            current += timedelta(days=1)
-        
-        while not self.is_working_day(current):
-            current += timedelta(days=1)
-        
-        return current
-    
-    def get_timetable_for_date(self, date: datetime) -> List[Dict]:
-        """Получает расписание на определенную дату"""
-        date_str = self.date_to_str(date)
-        classes = [row for row in self.data if row['Дата'] == date_str]
-        return sorted(classes, key=lambda x: int(x['Пара']))
-    
-    def format_timetable(self, date: datetime) -> str:
-        """Форматирует расписание для вывода"""
-        classes = self.get_timetable_for_date(date)
-        
-        if not classes:
-            return f"На {self.date_to_str(date)} пар не найдено."
-        
-        # Проверяем, это день только самоподготовки?
-        all_self_study = all(row['Дисциплина'] == '' for row in classes)
-        
-        if all_self_study:
-            return f"📚 {self.date_to_str(date)} (пт)\n\nРабота над диссертацией"
-        
-        lines = [f"📚 Расписание на {self.date_to_str(date)}:\n"]
-        
-        for cls in classes:
-            pair_num = cls['Пара']
-            subject = cls['Дисциплина'] or "-"
-            theme = cls['Номер темы'] or "-"
-            lesson_type = cls['Вид занятия'] or "-"
-            teacher = cls['Преподаватели'] or "-"
-            room = cls['Ауд.'] or "-"
-            
-            line = f"{pair_num}. {subject}"
-            if theme and theme != "-":
-                line += f" ({theme})"
-            line += f" | {lesson_type} | {teacher} | {room}"
-            
-            lines.append(line)
-        
+        self.csv_file = csv_file
+        self.by_date: Dict[str, List[LessonRow]] = {}
+        self.load_csv()
+
+    def load_csv(self) -> None:
+        if not os.path.exists(self.csv_file):
+            raise FileNotFoundError(f"CSV file not found: {self.csv_file}")
+
+        with open(self.csv_file, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter=";")
+            by_date: Dict[str, List[LessonRow]] = {}
+            for row in reader:
+                lr = LessonRow.from_csv_row(row)
+                if not lr.date_str:
+                    continue
+                by_date.setdefault(lr.date_str, []).append(lr)
+
+        # сортировка по номеру пары
+        for d, rows in by_date.items():
+            by_date[d] = sorted(rows, key=lambda x: x.pair)
+
+        self.by_date = by_date
+
+    def get_rows_for_date(self, dt: datetime) -> List[LessonRow]:
+        return self.by_date.get(format_date_ddmmyyyy(dt), [])
+
+    def has_study_on_date(self, dt: datetime) -> bool:
+        return len(self.get_rows_for_date(dt)) > 0
+
+    def is_self_study_day(self, dt: datetime) -> bool:
+        rows = self.get_rows_for_date(dt)
+        if not rows:
+            return False
+        # самоподготовка: все дисциплины пустые
+        return all((r.discipline or "").strip() == "" for r in rows)
+
+    def format_timetable(self, dt: datetime) -> str:
+        date_str = format_date_ddmmyyyy(dt)
+        rows = self.get_rows_for_date(dt)
+
+        if not rows:
+            return f"📚 Расписание на {date_str}:\n\nПар нет."
+
+        if self.is_self_study_day(dt):
+            return f"📚 Расписание на {date_str}:\n\nРабота над диссертацией"
+
+        lines: List[str] = [f"📚 Расписание на {date_str}:\n"]
+        for r in rows:
+            subject = r.discipline or "-"
+            theme = r.theme or ""
+            kind = r.kind or "-"
+            teachers = r.teachers or "-"
+            room = r.room or "-"
+
+            s = f"{r.pair}. {subject}"
+            if theme.strip():
+                s += f" ({theme.strip()})"
+            s += f" | {kind} | {teachers} | {room}"
+            lines.append(s)
+
         return "\n".join(lines)
+
+    def get_next_study_day(self, from_dt: Optional[datetime] = None) -> Optional[datetime]:
+        """
+        Ищет следующий "учебный день":
+        - по умолчанию: ближайший будний день, который присутствует в CSV
+        - если NEXT_DAY_MODE_USE_CSV=False: ближайший будний день (пн-пт) независимо от CSV
+        """
+        if from_dt is None:
+            from_dt = now_tz()
+
+        start = from_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        for i in range(1, MAX_LOOKAHEAD_DAYS + 1):
+            d = start + timedelta(days=i)
+
+            if not is_working_day(d):
+                continue
+
+            if NEXT_DAY_MODE_USE_CSV:
+                if self.has_study_on_date(d):
+                    return d
+            else:
+                return d
+
+        return None
+
+
+# ========= НАПОМИНАНИЯ =========
+@dataclass
+class UserReminders:
+    username: str  # без @
+    items: List[str]
 
 
 class ReminderStorage:
-    """Класс для хранения напоминаний"""
-    
-    def __init__(self, storage_file: str = "reminders.json"):
+    """
+    Хранение напоминаний "до ближайшего оглашения" (обычно это утреннее/вечернее авто-уведомление).
+
+    Формат файла:
+    {
+      "users": {
+        "12345": {"username": "ivan", "items": ["text1", "text2"]},
+        "67890": {"username": "maria", "items": ["text1"]}
+      }
+    }
+    """
+
+    def __init__(self, storage_file: str):
         self.storage_file = storage_file
-        self.reminders: Dict[int, List[str]] = {}  # user_id -> список напоминаний
-        self.announced_dates: List[str] = []
+        self.users: Dict[int, UserReminders] = {}
         self.load()
-    
-    def load(self):
-        """Загружает напоминания из файла"""
-        if os.path.exists(self.storage_file):
+
+    def load(self) -> None:
+        if not os.path.exists(self.storage_file):
+            self.users = {}
+            return
+
+        with open(self.storage_file, "r", encoding="utf-8") as f:
+            raw = json.load(f) or {}
+
+        users_raw = raw.get("users", {}) or {}
+        users: Dict[int, UserReminders] = {}
+        for k, v in users_raw.items():
             try:
-                with open(self.storage_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.reminders = {int(k): v for k, v in data.get('reminders', {}).items()}
-                    self.announced_dates = data.get('announced_dates', [])
-            except Exception as e:
-                print(f"Ошибка при загрузке напоминаний: {e}")
-    
-    def save(self):
-        """Сохраняет напоминания в файл"""
-        try:
-            data = {
-                'reminders': self.reminders,
-                'announced_dates': self.announced_dates
+                uid = int(k)
+            except Exception:
+                continue
+            username = (v.get("username") or "").strip()
+            items = v.get("items") or []
+            if not isinstance(items, list):
+                items = []
+            items = [normalize_text(str(x)) for x in items if normalize_text(str(x))]
+            if items:
+                users[uid] = UserReminders(username=username, items=items)
+
+        self.users = users
+
+    def save(self) -> None:
+        raw = {
+            "users": {
+                str(uid): {"username": ur.username, "items": ur.items}
+                for uid, ur in self.users.items()
             }
-            with open(self.storage_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"Ошибка при сохранении напоминаний: {e}")
-    
-    def add_reminder(self, user_id: int, text: str):
-        """Добавляет напоминание для пользователя"""
-        if user_id not in self.reminders:
-            self.reminders[user_id] = []
-        self.reminders[user_id].append(text)
+        }
+        with open(self.storage_file, "w", encoding="utf-8") as f:
+            json.dump(raw, f, ensure_ascii=False, indent=2)
+
+    def add(self, user_id: int, username: str, text: str) -> int:
+        text = normalize_text(text)
+        if not text:
+            return 0
+
+        username = (username or "").lstrip("@").strip()
+
+        ur = self.users.get(user_id)
+        if ur is None:
+            ur = UserReminders(username=username, items=[])
+            self.users[user_id] = ur
+        else:
+            # обновим username на более актуальный, если появился
+            if username:
+                ur.username = username
+
+        if len(ur.items) >= MAX_REMINDERS_PER_USER:
+            return -1
+
+        ur.items.append(text)
         self.save()
-    
-    def get_reminders(self, user_id: int) -> List[str]:
-        """Получает все напоминания пользователя"""
-        return self.reminders.get(user_id, [])
-    
-    def delete_all_reminders(self, user_id: int):
-        """Удаляет все напоминания пользователя"""
-        if user_id in self.reminders:
-            del self.reminders[user_id]
-            self.save()
-    
-    def delete_reminder(self, user_id: int, index: int):
-        """Удаляет конкретное напоминание пользователя"""
-        if user_id in self.reminders and 0 <= index < len(self.reminders[user_id]):
-            self.reminders[user_id].pop(index)
-            if not self.reminders[user_id]:
-                del self.reminders[user_id]
-            self.save()
-    
-    def get_all_reminders(self) -> Dict[int, List[str]]:
-        """Получает все напоминания со всеми пользователями"""
-        return self.reminders
-    
-    def clear_announced(self):
-        """Очищает список объявленных дат"""
-        self.announced_dates = []
+        return len(ur.items)
+
+    def get_user_items(self, user_id: int) -> List[str]:
+        ur = self.users.get(user_id)
+        return list(ur.items) if ur else []
+
+    def delete_one(self, user_id: int, index_1based: int) -> bool:
+        ur = self.users.get(user_id)
+        if not ur:
+            return False
+        idx = index_1based - 1
+        if idx < 0 or idx >= len(ur.items):
+            return False
+        ur.items.pop(idx)
+        if not ur.items:
+            self.users.pop(user_id, None)
         self.save()
-    
-    def mark_announced(self, date_str: str):
-        """Отмечает дату как объявленную"""
-        if date_str not in self.announced_dates:
-            self.announced_dates.append(date_str)
-            self.save()
-    
-    def is_announced_today(self, date_str: str) -> bool:
-        """Проверяет, была ли дата уже объявлена"""
-        return date_str in self.announced_dates
+        return True
+
+    def delete_all(self, user_id: int) -> bool:
+        if user_id not in self.users:
+            return False
+        self.users.pop(user_id, None)
+        self.save()
+        return True
+
+    def clear_all_users(self) -> None:
+        self.users = {}
+        self.save()
+
+    def all_users(self) -> Dict[int, UserReminders]:
+        return self.users
 
 
-# ================= ГЛОБАЛЬНЫЕ ОБЪЕКТЫ =================
+def format_reminders_block(users: Dict[int, UserReminders]) -> str:
+    """
+    Формат:
+    @ivan:
+    1. "..."
+    2. "..."
+
+    @maria:
+    "..."
+    """
+    if not users:
+        return ""
+
+    parts: List[str] = []
+    for _, ur in users.items():
+        uname = ur.username or "username"
+        parts.append(f"@{uname}:")
+        if len(ur.items) == 1:
+            parts.append(f"\"{ur.items[0]}\"")
+        else:
+            for i, text in enumerate(ur.items, 1):
+                parts.append(f"{i}. \"{text}\"")
+        parts.append("")  # пустая строка между пользователями
+    return "\n".join(parts).rstrip()
+
+
+# ========= БОТ =========
 timetable = Timetable(CSV_FILE)
-reminders = ReminderStorage()
-user_names: Dict[int, str] = {}  # Кэш имен пользователей
+reminders = ReminderStorage(REMINDERS_FILE)
+
+BTN_TIMETABLE = "📅 Расписание"
+BTN_MY_REMINDERS = "⏰ Мои напоминания"
+BTN_ADD_REMINDER = "➕ Добавить напоминание"
+BTN_DEL_REMINDER = "🗑️ Удалить напоминание"
+
+CB_DEL_ONE_PREFIX = "del_one:"
+CB_DEL_ALL = "del_all"
 
 
-# ================= КОМАНДЫ =================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start"""
-    user = update.effective_user
-    user_names[user.id] = user.first_name or "Пользователь"
-    
+def main_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
-        ["📅 Расписание", "⏰ Мои напоминания"],
-        ["➕ Добавить напоминание", "🗑️ Удалить напоминание"]
+        [BTN_TIMETABLE, BTN_MY_REMINDERS],
+        [BTN_ADD_REMINDER, BTN_DEL_REMINDER],
     ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    await update.message.reply_text(
-        f"Привет, {user.first_name}! 👋\n\n"
-        f"Я помогу тебе не забыть про учебные занятия.\n\n"
-        f"Chat ID (для конфига): {update.effective_chat.id}",
-        reply_markup=reply_markup
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    await update.effective_message.reply_text(
+        "Меню бота готово.\n\n"
+        f"Chat ID (для конфига): {chat_id}",
+        reply_markup=main_keyboard(),
     )
 
 
-async def get_timetable_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /get_timetable [ДД.МММ.ГГГГ]"""
-    user = update.effective_user
-    user_names[user.id] = user.first_name or "Пользователь"
-    
-    # Парсим дату из аргументов
-    target_date = None
-    
-    if context.args:
-        try:
-            date_str = context.args[0]
-            target_date = timetable.parse_date(date_str)
-        except ValueError:
-            await update.message.reply_text("❌ Неверный формат даты. Используй: /get_timetable 01.02.2026")
+async def cmd_get_timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # /get_timetable [DD.MM.YYYY]
+    args = context.args or []
+    if args:
+        ds = args[0].strip()
+        if not DATE_RE.match(ds):
+            await update.effective_message.reply_text(
+                "❌ Неверный формат даты. Используй: /get_timetable 01.02.2026"
+            )
             return
-    else:
-        # Если даты нет, берем следующий учебный день
-        target_date = timetable.get_next_working_day()
-    
-    # Формируем ответ
-    message = timetable.format_timetable(target_date)
-    
-    # Добавляем напоминания, если они есть
-    date_str = timetable.date_to_str(target_date)
-    if not reminders.is_announced_today(date_str) and reminders.get_all_reminders():
-        reminders_text = format_reminders_output(reminders.get_all_reminders(), user_names)
-        if reminders_text:
-            message += "\n\n" + reminders_text
-            reminders.mark_announced(date_str)
-    
-    await update.message.reply_text(message)
+        dt = parse_date_ddmmyyyy(ds)
+        # делаем дату в нашей TZ (только дата важна)
+        dt = TIMEZONE.localize(dt)
+        msg = timetable.format_timetable(dt)
+        await update.effective_message.reply_text(msg)
+        return
+
+    next_day = timetable.get_next_study_day(now_tz())
+    if not next_day:
+        await update.effective_message.reply_text("Пар впереди не найдено в пределах расписания.")
+        return
+
+    msg = timetable.format_timetable(next_day)
+    await update.effective_message.reply_text(msg)
 
 
-async def set_reminder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /set_reminder "text" """
-    user = update.effective_user
-    user_names[user.id] = user.first_name or "Пользователь"
-    
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Использование: /set_reminder \"Твоё напоминание\"\n\n"
-            "Пример: /set_reminder \"Подготовить доклад\""
+async def cmd_set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # /set_reminder "text"
+    text = " ".join(context.args or [])
+    text = text.strip().strip("\"").strip("'").strip()
+
+    if not text:
+        await update.effective_message.reply_text(
+            "❌ Использование: /set_reminder \"Текст напоминания\""
         )
         return
-    
-    reminder_text = " ".join(context.args).strip('"')
-    
-    if len(reminder_text) > 200:
-        await update.message.reply_text("❌ Напоминание слишком длинное (макс. 200 символов)")
+
+    if len(text) > 500:
+        await update.effective_message.reply_text("❌ Слишком длинно (макс 500 символов).")
         return
-    
-    reminders.add_reminder(user.id, reminder_text)
-    user_reminders = reminders.get_reminders(user.id)
-    await update.message.reply_text(
-        f"✅ Напоминание добавлено: '{reminder_text}'\n\n"
-        f"У тебя {len(user_reminders)} напоминани{'е' if len(user_reminders) == 1 else 'й'}"
+
+    user = update.effective_user
+    username = (user.username or user.first_name or "user").strip()
+    count = reminders.add(user.id, username=username, text=text)
+
+    if count == -1:
+        await update.effective_message.reply_text(
+            f"❌ Достигнут лимит напоминаний ({MAX_REMINDERS_PER_USER})."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        f"✅ Добавлено. Сейчас у тебя {count} напоминаний(я) до ближайшего оглашения."
     )
 
 
-def format_reminders_output(all_reminders: Dict[int, List[str]], user_names: Dict[int, str]) -> str:
-    """Форматирует напоминания для вывода"""
-    lines = []
-    
-    for user_id, user_reminders_list in all_reminders.items():
-        if not user_reminders_list:
-            continue
-        
-        username = user_names.get(user_id, f"User {user_id}")
-        lines.append(f"@{username}:")
-        
-        if len(user_reminders_list) == 1:
-            lines.append(f"\"{user_reminders_list[0]}\"")
-        else:
-            for i, reminder in enumerate(user_reminders_list, 1):
-                lines.append(f"{i}. \"{reminder}\"")
-        
-        lines.append("")  # Пустая строка между пользователями
-    
-    return "\n".join(lines).rstrip()
-
-
-# ================= КНОПКИ =================
-
-async def button_timetable(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Кнопка 'Расписание'"""
+async def show_my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    user_names[user.id] = user.first_name or "Пользователь"
-    
-    # Отправляем форму для выбора даты
-    keyboard = [
-        [InlineKeyboardButton("Сегодня", callback_data="timetable_today")],
-        [InlineKeyboardButton("Завтра", callback_data="timetable_tomorrow")],
-        [InlineKeyboardButton("Следующий рабочий день", callback_data="timetable_next")],
-        [InlineKeyboardButton("Указать дату", callback_data="timetable_custom")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text("📅 Выбери дату:", reply_markup=reply_markup)
-
-
-async def button_my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Кнопка 'Мои напоминания'"""
-    user = update.effective_user
-    user_names[user.id] = user.first_name or "Пользователь"
-    
-    user_reminders = reminders.get_reminders(user.id)
-    
-    if user_reminders:
-        lines = ["📌 Твои напоминания:\n"]
-        for i, reminder in enumerate(user_reminders, 1):
-            lines.append(f"{i}. \"{reminder}\"")
-        await update.message.reply_text("\n".join(lines))
-    else:
-        await update.message.reply_text("📌 У тебя пока нет установленных напоминаний.")
-
-
-async def button_add_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Кнопка 'Добавить напоминание'"""
-    user = update.effective_user
-    user_names[user.id] = user.first_name or "Пользователь"
-    
-    await update.message.reply_text(
-        "✍️ Напиши свое напоминание (максимум 200 символов):\n\n"
-        "Или используй команду: /set_reminder \"Твой текст\""
-    )
-    context.user_data['waiting_for_reminder'] = True
-
-
-async def button_delete_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Кнопка 'Удалить напоминание'"""
-    user = update.effective_user
-    user_names[user.id] = user.first_name or "Пользователь"
-    
-    user_reminders = reminders.get_reminders(user.id)
-    
-    if not user_reminders:
-        await update.message.reply_text("❌ У тебя нет напоминаний для удаления.")
+    items = reminders.get_user_items(user.id)
+    if not items:
+        await update.effective_message.reply_text("📌 У тебя нет напоминаний.")
         return
-    
-    if len(user_reminders) == 1:
-        reminders.delete_all_reminders(user.id)
-        await update.message.reply_text("🗑️ Напоминание удалено.")
-    else:
-        lines = ["🗑️ Какое напоминание удалить?\n"]
-        for i, reminder in enumerate(user_reminders, 1):
-            lines.append(f"{i}. \"{reminder}\"")
-        lines.append("\nОтправь номер (например: 2) или 'все' для удаления всех")
-        
-        await update.message.reply_text("\n".join(lines))
-        context.user_data['waiting_for_deletion'] = user.id
+
+    lines = ["📌 Твои напоминания:"]
+    for i, t in enumerate(items, 1):
+        lines.append(f"{i}. \"{t}\"")
+    await update.effective_message.reply_text("\n".join(lines))
 
 
-async def handle_text_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текста напоминания"""
-    user = update.effective_user
-    user_names[user.id] = user.first_name or "Пользователь"
-    
-    if context.user_data.get('waiting_for_reminder'):
-        reminder_text = update.message.text.strip()
-        
-        if len(reminder_text) > 200:
-            await update.message.reply_text("❌ Напоминание слишком длинное (макс. 200 символов)")
+async def ask_add_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["waiting_for_reminder_text"] = True
+    await update.effective_message.reply_text("✍️ Отправь текст напоминания одним сообщением.")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.effective_message.text or "").strip()
+
+    # кнопки
+    if text == BTN_TIMETABLE:
+        await cmd_get_timetable(update, context)
+        return
+    if text == BTN_MY_REMINDERS:
+        await show_my_reminders(update, context)
+        return
+    if text == BTN_ADD_REMINDER:
+        await ask_add_reminder(update, context)
+        return
+    if text == BTN_DEL_REMINDER:
+        await show_delete_menu(update, context)
+        return
+
+    # ожидаем ввод напоминания
+    if context.user_data.get("waiting_for_reminder_text"):
+        context.user_data["waiting_for_reminder_text"] = False
+        # добавляем напоминание
+        user = update.effective_user
+        reminder_text = normalize_text(text)
+        if not reminder_text:
+            await update.effective_message.reply_text("❌ Пустое напоминание не добавлено.")
             return
-        
-        reminders.add_reminder(user.id, reminder_text)
-        user_reminders = reminders.get_reminders(user.id)
-        await update.message.reply_text(
-            f"✅ Напоминание добавлено: '{reminder_text}'\n\n"
-            f"У тебя {len(user_reminders)} напоминани{'е' if len(user_reminders) == 1 else 'й'}"
+        if len(reminder_text) > 500:
+            await update.effective_message.reply_text("❌ Слишком длинно (макс 500 символов).")
+            return
+
+        username = (user.username or user.first_name or "user").strip()
+        count = reminders.add(user.id, username=username, text=reminder_text)
+
+        if count == -1:
+            await update.effective_message.reply_text(
+                f"❌ Достигнут лимит напоминаний ({MAX_REMINDERS_PER_USER})."
+            )
+            return
+
+        await update.effective_message.reply_text(
+            f"✅ Добавлено. Сейчас у тебя {count} напоминаний(я) до ближайшего оглашения."
         )
-        context.user_data['waiting_for_reminder'] = False
-
-
-async def handle_deletion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка удаления напоминания"""
-    user = update.effective_user
-    user_names[user.id] = user.first_name or "Пользователь"
-    
-    if context.user_data.get('waiting_for_deletion') == user.id:
-        text = update.message.text.strip().lower()
-        user_reminders = reminders.get_reminders(user.id)
-        
-        if text == "все":
-            reminders.delete_all_reminders(user.id)
-            await update.message.reply_text("🗑️ Все напоминания удалены.")
-        else:
-            try:
-                index = int(text) - 1
-                if 0 <= index < len(user_reminders):
-                    deleted = user_reminders[index]
-                    reminders.delete_reminder(user.id, index)
-                    await update.message.reply_text(f"🗑️ Удалено: \"{deleted}\"")
-                else:
-                    await update.message.reply_text("❌ Неверный номер")
-            except ValueError:
-                await update.message.reply_text("❌ Введи номер или 'все'")
-        
-        context.user_data['waiting_for_deletion'] = None
-
-
-async def callback_timetable(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка кнопок расписания"""
-    query = update.callback_query
-    await query.answer()
-    
-    user = update.effective_user
-    user_names[user.id] = user.first_name or "Пользователь"
-    
-    now = datetime.now(TIMEZONE)
-    
-    if query.data == "timetable_today":
-        target_date = now
-    elif query.data == "timetable_tomorrow":
-        target_date = now + timedelta(days=1)
-    elif query.data == "timetable_next":
-        target_date = timetable.get_next_working_day(now)
-    elif query.data == "timetable_custom":
-        await query.edit_message_text(
-            "📅 Отправь дату в формате: ДД.МММ.ГГГГ\n\n"
-            "Пример: 01.02.2026"
-        )
-        context.user_data['waiting_for_date'] = True
         return
-    else:
-        return
-    
-    message = timetable.format_timetable(target_date)
-    
-    # Добавляем напоминания, если они есть
-    date_str = timetable.date_to_str(target_date)
-    if not reminders.is_announced_today(date_str) and reminders.get_all_reminders():
-        reminders_text = format_reminders_output(reminders.get_all_reminders(), user_names)
-        if reminders_text:
-            message += "\n\n" + reminders_text
-            reminders.mark_announced(date_str)
-    
-    await query.edit_message_text(message)
+
+    # fallback
+    await update.effective_message.reply_text(
+        "Не понял сообщение.\n\n"
+        "Команды:\n"
+        "/get_timetable [ДД.ММ.ГГГГ]\n"
+        "/set_reminder \"текст\""
+    )
 
 
-async def handle_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка кастомной даты"""
+async def show_delete_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    user_names[user.id] = user.first_name or "Пользователь"
-    
-    if context.user_data.get('waiting_for_date'):
+    items = reminders.get_user_items(user.id)
+    if not items:
+        await update.effective_message.reply_text("🗑️ У тебя нет напоминаний для удаления.")
+        return
+
+    buttons: List[List[InlineKeyboardButton]] = []
+    for i, t in enumerate(items, 1):
+        label = f"Удалить #{i}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"{CB_DEL_ONE_PREFIX}{i}")])
+    buttons.append([InlineKeyboardButton("Удалить все", callback_data=CB_DEL_ALL)])
+
+    await update.effective_message.reply_text(
+        "🗑️ Выбери, что удалить:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+
+    user = update.effective_user
+    data = q.data or ""
+
+    if data == CB_DEL_ALL:
+        ok = reminders.delete_all(user.id)
+        await q.edit_message_text("✅ Все напоминания удалены." if ok else "Нет напоминаний.")
+        return
+
+    if data.startswith(CB_DEL_ONE_PREFIX):
+        n_s = data[len(CB_DEL_ONE_PREFIX):]
         try:
-            target_date = timetable.parse_date(update.message.text.strip())
-            message = timetable.format_timetable(target_date)
-            
-            # Добавляем напоминания, если они есть
-            date_str = timetable.date_to_str(target_date)
-            if not reminders.is_announced_today(date_str) and reminders.get_all_reminders():
-                reminders_text = format_reminders_output(reminders.get_all_reminders(), user_names)
-                if reminders_text:
-                    message += "\n\n" + reminders_text
-                    reminders.mark_announced(date_str)
-            
-            await update.message.reply_text(message)
-            context.user_data['waiting_for_date'] = False
-        except ValueError:
-            await update.message.reply_text("❌ Неверный формат даты. Используй: ДД.МММ.ГГГГ")
+            n = int(n_s)
+        except Exception:
+            await q.edit_message_text("❌ Некорректный выбор.")
+            return
+        ok = reminders.delete_one(user.id, n)
+        await q.edit_message_text("✅ Удалено." if ok else "❌ Не найдено.")
+        return
 
 
-# ================= АВТОМАТИЧЕСКИЕ НАПОМИНАНИЯ =================
+# ========= АВТОУВЕДОМЛЕНИЯ =========
+async def send_schedule_to_chat(target_date: datetime, *, label: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    label: строка для логов/отладки, например 'morning'/'evening'
+    """
+    if not is_working_day(target_date):
+        return
 
-async def scheduled_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Запускает запланированное напоминание"""
-    now = datetime.now(TIMEZONE)
-    target_hour, target_minute = context.job.data['time']
-    
-    # Определяем дату для напоминания
-    if now.hour < target_hour or (now.hour == target_hour and now.minute < target_minute):
-        # Утреннее напоминание - на сегодня
-        target_date = now
-    else:
-        # Вечернее напоминание - на завтра
-        target_date = now + timedelta(days=1)
-    
-    # Проверяем, это учебный день?
-    classes = timetable.get_timetable_for_date(target_date)
-    
-    if not classes:
-        return  # Нет пар на эту дату
-    
-    date_str = timetable.date_to_str(target_date)
-    
-    # Формируем сообщение
-    message = timetable.format_timetable(target_date)
-    
-    # Добавляем напоминания
-    if reminders.get_all_reminders():
-        reminders_text = format_reminders_output(reminders.get_all_reminders(), user_names)
-        if reminders_text:
-            message += "\n\n" + reminders_text
-    
-    # Отправляем сообщение
-    try:
-        await context.bot.send_message(chat_id=CHAT_ID, text=message)
-        reminders.mark_announced(date_str)
-    except Exception as e:
-        print(f"Ошибка при отправке напоминания: {e}")
+    if not timetable.has_study_on_date(target_date):
+        return
+
+    msg = timetable.format_timetable(target_date)
+
+    # приклеиваем "следующие напоминания" и очищаем их (т.к. они "к следующему уведомлению")
+    all_users = reminders.all_users()
+    if all_users:
+        block = format_reminders_block(all_users)
+        if block:
+            msg = msg + "\n\n" + block
+        reminders.clear_all_users()
+
+    await context.bot.send_message(chat_id=CHAT_ID, text=msg)
 
 
-# ================= ГЛАВНАЯ ФУНКЦИЯ =================
+async def job_morning(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # 7:30 рабочего дня — расписание на сегодня
+    today = now_tz().replace(hour=0, minute=0, second=0, microsecond=0)
+    await send_schedule_to_chat(today, label="morning", context=context)
 
-async def main():
-    """Главная функция для запуска бота"""
-    # Создаем приложение
-    application = Application.builder().token(TOKEN).build()
-    
-    # Обработчики команд
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("get_timetable", get_timetable_cmd))
-    application.add_handler(CommandHandler("set_reminder", set_reminder_cmd))
-    
-    # Обработчики кнопок
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
-    application.add_handler(CallbackQueryHandler(callback_timetable, pattern="^timetable_"))
-    
-    # Планируем автоматические напоминания
+
+async def job_evening(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # 19:30 — расписание на завтра, если завтра рабочий день
+    tomorrow = (now_tz().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1))
+    await send_schedule_to_chat(tomorrow, label="evening", context=context)
+
+
+def schedule_jobs(application: Application) -> None:
     job_queue = application.job_queue
-    
-    # Утреннее напоминание в 7:30
-    job_queue.run_daily(
-        scheduled_reminder,
-        time=datetime.combine(datetime.now().date(), datetime.min.time()).replace(
-            hour=REMINDER_MORNING_TIME[0],
-            minute=REMINDER_MORNING_TIME[1]
-        ).time(),
-        data={'time': REMINDER_MORNING_TIME},
-        name='morning_reminder',
-        tzinfo=TIMEZONE
-    )
-    
-    # Вечернее напоминание в 19:30
-    job_queue.run_daily(
-        scheduled_reminder,
-        time=datetime.combine(datetime.now().date(), datetime.min.time()).replace(
-            hour=REMINDER_EVENING_TIME[0],
-            minute=REMINDER_EVENING_TIME[1]
-        ).time(),
-        data={'time': REMINDER_EVENING_TIME},
-        name='evening_reminder',
-        tzinfo=TIMEZONE
-    )
-    
-    print("🤖 Бот запущен!")
-    print(f"⏰ Часовой пояс: {TIMEZONE}")
-    
-    # Запускаем бота
+    if job_queue is None:
+        raise RuntimeError(
+            "JobQueue не доступен. Установи зависимости: "
+            "pip install \"python-telegram-bot[job-queue]\""
+        )
+
+    morning_time = dtime(REMINDER_MORNING_TIME[0], REMINDER_MORNING_TIME[1], tzinfo=TIMEZONE)
+    evening_time = dtime(REMINDER_EVENING_TIME[0], REMINDER_EVENING_TIME[1], tzinfo=TIMEZONE)
+
+    # run_daily по умолчанию каждый день; внутри job_* мы дополнительно проверяем "рабочий день"
+    job_queue.run_daily(job_morning, time=morning_time, name="morning_reminder")
+    job_queue.run_daily(job_evening, time=evening_time, name="evening_reminder")
+
+
+# ========= MAIN =========
+async def main() -> None:
+    application = Application.builder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("get_timetable", cmd_get_timetable))
+    application.add_handler(CommandHandler("set_reminder", cmd_set_reminder))
+
+    application.add_handler(CallbackQueryHandler(on_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    schedule_jobs(application)
+
+    print("🤖 Bot started")
+    print(f"⏰ TIMEZONE: {TIMEZONE}")
+
     await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Общая обработка текста"""
-    user = update.effective_user
-    user_names[user.id] = user.first_name or "Пользователь"
-    
-    text = update.message.text.strip()
-    
-    # Проверяем кнопки
-    if text == "📅 Расписание":
-        await button_timetable(update, context)
-    elif text == "⏰ Мои напоминания":
-        await button_my_reminders(update, context)
-    elif text == "➕ Добавить напоминание":
-        await button_add_reminder(update, context)
-    elif text == "🗑️ Удалить напоминание":
-        await button_delete_reminder(update, context)
-    elif context.user_data.get('waiting_for_reminder'):
-        await handle_text_reminder(update, context)
-    elif context.user_data.get('waiting_for_deletion'):
-        await handle_deletion(update, context)
-    elif context.user_data.get('waiting_for_date'):
-        await handle_custom_date(update, context)
-    else:
-        await update.message.reply_text(
-            "❓ Не знаю такую команду. Используй кнопки или команды:\n\n"
-            "/get_timetable [ДД.МММ.ГГГГ]\n"
-            "/set_reminder \"текст\"\n"
-            "/start"
-        )
-
-
-if __name__ == '__main__':
-    import logging
-    logging.basicConfig(level=logging.INFO)
-    
+if __name__ == "__main__":
     asyncio.run(main())
