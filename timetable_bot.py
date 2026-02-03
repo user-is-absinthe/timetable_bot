@@ -151,13 +151,6 @@ class Timetable:
     def has_study_on_date(self, dt: datetime) -> bool:
         return len(self.get_rows_for_date(dt)) > 0
 
-    def is_self_study_day(self, dt: datetime) -> bool:
-        rows = self.get_rows_for_date(dt)
-        if not rows:
-            return False
-        # самоподготовка: все дисциплины пустые
-        return all((r.discipline or "").strip() == "" for r in rows)
-
     def format_timetable(self, dt: datetime) -> str:
         date_str = format_date_ddmmyyyy(dt)
         rows = self.get_rows_for_date(dt)
@@ -165,24 +158,48 @@ class Timetable:
         if not rows:
             return f"📚 Расписание на {date_str}:\n\nПар нет."
 
-        if self.is_self_study_day(dt):
-            return f"📚 Расписание на {date_str}:\n\nРабота над диссертацией"
+        # Определяем день недели
+        weekdays = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
+        weekday = weekdays[dt.weekday()]
 
-        lines: List[str] = [f"📚 Расписание на {date_str}:\n"]
+        lines: List[str] = [f"📚 Расписание на {date_str} ({weekday})\n"]
+
         for r in rows:
-            subject = r.discipline or "-"
-            theme = r.theme or ""
-            kind = r.kind or "-"
-            teachers = r.teachers or "-"
-            room = r.room or "-"
+            subject = r.discipline.strip() if r.discipline else ""
+            theme = r.theme.strip() if r.theme else ""
+            kind = r.kind.strip() if r.kind else ""
+            teachers = r.teachers.strip() if r.teachers else ""
+            room = r.room.strip() if r.room else ""
 
-            s = f"{r.pair}. {subject}"
-            if theme.strip():
-                s += f" ({theme.strip()})"
-            s += f" | {kind} | {teachers} | {room}"
-            lines.append(s)
+            # Формируем красивую запись для пары
+            pair_lines = [f"🔹 Пара {r.pair}"]
 
-        return "\n".join(lines)
+            if subject:
+                pair_lines.append(f"   📖 {subject}")
+                if theme:
+                    pair_lines.append(f"   📝 Тема: {theme}")
+            else:
+                pair_lines.append(f"   📖 —")
+
+            if kind:
+                kind_emoji = {
+                    'л': '👨‍🏫 Лекция',
+                    'пр': '✍️ Практика',
+                    'сем': '💬 Семинар',
+                    'лаб': '🔬 Лабораторная'
+                }.get(kind.lower(), f'📌 {kind}')
+                pair_lines.append(f"   {kind_emoji}")
+
+            if teachers:
+                pair_lines.append(f"   👤 {teachers}")
+
+            if room:
+                pair_lines.append(f"   🚪 Ауд. {room}")
+
+            lines.append("\n".join(pair_lines))
+            lines.append("")  # Пустая строка между парами
+
+        return "\n".join(lines).rstrip()
 
     def get_next_study_day(self, from_dt: Optional[datetime] = None) -> Optional[datetime]:
         """
