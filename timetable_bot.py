@@ -456,6 +456,11 @@ async def ask_add_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Игнорируем сообщения из групп (не команды)
+    if update.effective_chat.type in ["group", "supergroup"]:
+        return
+
+    # Ниже код работает только в приватных чатах
     text = (update.effective_message.text or "").strip()
 
     # кнопки
@@ -475,7 +480,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # ожидаем ввод напоминания
     if context.user_data.get("waiting_for_reminder_text"):
         context.user_data["waiting_for_reminder_text"] = False
-        # добавляем напоминание
         user = update.effective_user
         reminder_text = normalize_text(text)
         if not reminder_text:
@@ -499,7 +503,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # fallback
+    # fallback - только в приватном чате
     await update.effective_message.reply_text(
         "Не понял сообщение.\n\n"
         "Команды:\n"
